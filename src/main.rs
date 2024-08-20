@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     io,
+    process::exit,
     sync::{Arc, Mutex},
 };
 
@@ -108,6 +109,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::default();
     println!("Loading monitors..");
     app.manager.refresh()?;
+
+    if app.manager.displays.len() == 0 {
+        println!("No displays!");
+        exit(1);
+    }
 
     // setup terminal
     enable_raw_mode()?;
