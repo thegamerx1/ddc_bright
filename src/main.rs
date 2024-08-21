@@ -2,7 +2,7 @@ use std::{
     error::Error,
     io,
     process::exit,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use crossterm::{
@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use display::{Controller, DisplayManager, MyDisplay};
+use display::{DisplayManager, WrappedController, WrappedDisplay};
 use ratatui::{prelude::*, widgets::*};
 
 mod display;
@@ -18,7 +18,7 @@ mod display;
 enum InputMode {
     Select,
     Help,
-    Selected(Arc<MyDisplay>),
+    Selected(WrappedDisplay),
 }
 
 /// App holds the state of the application
@@ -30,11 +30,11 @@ struct App {
     show_help: bool,
 
     control_index: usize,
-    control_selected: Option<Arc<Mutex<Controller>>>,
+    control_selected: Option<WrappedController>,
     control_widget_state: ListState,
 
     display_index: usize,
-    display_selected: Option<Arc<MyDisplay>>,
+    display_selected: Option<WrappedDisplay>,
     display_widget_state: ListState,
 }
 
@@ -60,7 +60,7 @@ impl Default for App {
 impl App {
     fn select_display(&mut self) {
         if let Some(display) = self.manager.displays.get(self.display_index) {
-            self.display_selected = Some(Arc::clone(display));
+            self.display_selected = Some(display.clone());
             self.select_control(0);
             self.input_mode =
                 InputMode::Selected(Arc::clone(self.display_selected.as_ref().unwrap()));
@@ -82,7 +82,7 @@ impl App {
         if desired >= length {
             desired = 0;
         }
-        let control = Arc::clone(display.controls.get(desired).unwrap());
+        let control = display.controls.values().nth(desired).unwrap().clone();
         self.control_index = desired;
         self.control_selected = Some(control);
         self.control_widget_state.select(Some(desired));
@@ -97,10 +97,15 @@ impl App {
     }
 
     fn add_to_control(&mut self, value: i16) {
-        if let Some(control_mutex) = &mut self.control_selected {
-            let mut control = control_mutex.lock().unwrap();
-            let value = std::cmp::max(std::cmp::min(control.value as i16 + value, 100), 0) as u16;
-            control.set(value).unwrap()
+        if let Some(control_mutex) = &self.control_selected {
+            // let mut control = control_mutex.lock().unwrap();
+            // let value = std::cmp::max(std::cmp::min(control.value as i16 + value, 100), 0) as u16;
+            // control.set(value).unwrap()
+            self.manager.queue_change(
+                self.display_selected.as_ref().unwrap().clone(),
+                control_mutex.clone(),
+                value,
+            );
         }
     }
 }
@@ -252,11 +257,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         let control_widget: Vec<ListItem> = display
             .controls
             .iter()
-            .map(|controller_mutex| {
-                let controller = controller_mutex.lock().unwrap();
+            .map(|(control, controller)| {
+                let controller = controller.read().unwrap();
                 let content = Line::from(Span::raw(format!(
                     "{0}: {1}",
-                    controller.control.name, controller.value
+                    control.get_name(),
+                    controller.value
                 )));
                 ListItem::new(content)
             })

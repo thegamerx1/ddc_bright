@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "ddc_bright"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "crossterm 0.27.0",
  "ddc-hi",

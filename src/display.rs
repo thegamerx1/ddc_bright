@@ -1,91 +1,152 @@
-use std::sync::{Arc, Mutex};
-
 use ddc_hi::{Ddc, DdcHost, Display, Handle};
+use std::cmp::{max, min};
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::sync::{mpsc::Sender, Arc, Mutex};
+use std::{sync::mpsc::channel, thread};
 
-pub struct Control {
-    pub code: u8,
-    pub name: &'static str,
+#[derive(PartialEq, PartialOrd, Eq, Hash, Clone, Copy)]
+pub enum Control {
+    BRIGHTNESS = 0x10,
+    CONTRAST = 0x12,
 }
 
-pub const BRIGHTNESS: Control = Control {
-    code: 0x10,
-    name: "Brightness",
-};
-pub const CONTRAST: Control = Control {
-    code: 0x12,
-    name: "Contrast",
-};
-
-// Controller for each value
-pub struct Controller {
-    pub value: u16,
-    handle: Arc<Mutex<Handle>>,
-    pub control: Control,
-}
-
-impl Controller {
-    pub fn new(control: Control, handle: Arc<Mutex<Handle>>) -> Self {
-        Self {
-            handle,
-            control,
-            value: 0,
+impl Control {
+    pub fn get_name(&self) -> &'static str {
+        match &self {
+            Control::BRIGHTNESS => "Brightness",
+            Control::CONTRAST => "Contrast",
         }
     }
+}
 
-    pub fn get(&mut self) -> Result<u16, <Handle as DdcHost>::Error> {
-        let mut handle = self.handle.lock().unwrap();
-        let value = handle.get_vcp_feature(self.control.code)?.value();
-        self.value = value;
-        Ok(value)
-    }
+const ALL_CONTROLS: [Control; 2] = [Control::BRIGHTNESS, Control::CONTRAST];
 
-    pub fn set(&mut self, value: u16) -> Result<(), <Handle as DdcHost>::Error> {
-        let mut handle = self.handle.lock().unwrap();
-        handle.set_vcp_feature(self.control.code, value)?;
-        self.value = value;
-        Ok(())
-    }
+#[derive(Clone, Copy)]
+pub struct Controller {
+    pub value: u16,
+    pub kind: Control,
 }
 
 pub struct MyDisplay {
     handle: Arc<Mutex<Handle>>,
     pub name: String,
-    pub controls: Vec<Arc<Mutex<Controller>>>,
+    pub controls: HashMap<Control, WrappedController>,
+}
+
+impl MyDisplay {
+    pub fn new(handle: Handle, name: String) -> Self {
+        let mut controls = HashMap::new();
+        for control in ALL_CONTROLS {
+            controls.insert(
+                control,
+                Arc::new(RwLock::new(Controller {
+                    kind: control,
+                    value: 0,
+                })),
+            );
+        }
+
+        Self {
+            handle: Arc::new(Mutex::new(handle)),
+            name,
+            controls,
+        }
+    }
+
+    fn load(&self) {
+        for control in ALL_CONTROLS {
+            let value = self.get(control.clone());
+            let mut controller = self.controls.get(&control).unwrap().write().unwrap();
+            controller.value = value;
+        }
+    }
+
+    pub fn get(&self, control: Control) -> u16 {
+        let mut handle = self.handle.lock().unwrap();
+        handle.get_vcp_feature(control as u8).unwrap().value()
+    }
+
+    pub fn set(&self, control: Control, value: u16) -> () {
+        let mut handle = self.handle.lock().unwrap();
+        handle.set_vcp_feature(control as u8, value).unwrap();
+    }
+}
+
+pub type WrappedDisplay = Arc<MyDisplay>;
+pub type WrappedController = Arc<RwLock<Controller>>;
+
+struct Change {
+    display: WrappedDisplay,
+    controller: Controller,
 }
 
 pub struct DisplayManager {
-    pub displays: Vec<Arc<MyDisplay>>,
+    pub displays: Vec<WrappedDisplay>,
+    changes: Arc<Mutex<Vec<Change>>>,
+    tx_queue: Sender<()>,
 }
 
 impl DisplayManager {
     pub fn new() -> Self {
-        Self { displays: vec![] }
+        let changes = Arc::new(Mutex::new(vec![]));
+        let changes_clone = changes.clone();
+        let (sender, receiver) = channel::<()>();
+
+        thread::spawn(move || loop {
+            if receiver.recv().is_err() {
+                return;
+            }
+            let mut changes = changes_clone.lock().unwrap();
+            let change: Change = changes.remove(0);
+            drop(changes);
+
+            change
+                .display
+                .set(change.controller.kind, change.controller.value);
+        });
+
+        Self {
+            displays: vec![],
+            changes,
+            tx_queue: sender,
+        }
+    }
+
+    pub fn queue_change(&self, display: WrappedDisplay, controller: WrappedController, value: i16) {
+        match self.tx_queue.send(()) {
+            Ok(()) => (),
+            Err(err) => {
+                eprintln!("{err}");
+            }
+        }
+
+        let mut control = controller.write().unwrap();
+        control.value = max(min(control.value as i16 + value, 100), 0) as u16;
+
+        let mut changes = self.changes.lock().unwrap();
+        changes.push(Change {
+            display: display,
+            controller: control.clone(),
+        });
     }
 
     pub fn refresh(&mut self) -> Result<(), <Handle as DdcHost>::Error> {
         self.displays.clear();
-        for mut display in Display::enumerate() {
-            display.update_capabilities().unwrap();
-            let handle = Arc::new(Mutex::new(display.handle));
-
-            let mut brightness = Controller::new(BRIGHTNESS, Arc::clone(&handle));
-            let mut contrast = Controller::new(CONTRAST, Arc::clone(&handle));
-            brightness.get()?;
-            contrast.get()?;
-
-            self.displays.push(Arc::new(MyDisplay {
-                name: display.info.model_name.unwrap_or_else(|| {
+        for display in Display::enumerate() {
+            let display = MyDisplay::new(
+                display.handle,
+                display.info.model_name.unwrap_or_else(|| {
                     display
                         .info
                         .serial_number
                         .unwrap_or_else(|| display.info.id)
                 }),
-                controls: vec![
-                    Arc::new(Mutex::new(brightness)),
-                    Arc::new(Mutex::new(contrast)),
-                ],
-                handle,
-            }));
+            );
+
+            display.load();
+
+            self.displays.push(Arc::new(display));
         }
         Ok(())
     }
